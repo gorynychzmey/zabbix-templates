@@ -12,7 +12,7 @@ zabbix_export:
 
         What it collects:
         - latest non-empty minute bucket for message usage tokens
-        - latest non-empty hour bucket for spend
+        - spend for previous UTC day
         - cumulative spend for current UTC day
         - cumulative spend for current UTC month
 
@@ -25,9 +25,6 @@ zabbix_export:
         - Anthropic documents that usage/cost data is typically available with a delay of up to ~5 minutes.
         - All time calculations are done in UTC because Anthropic bucket boundaries are UTC.
         - The API key is stored in a user macro for simplicity. After import, convert it to Secret text in the UI if desired.
-      vendor:
-        name: OpenAI
-        version: '1.0'
       groups:
         - name: 'Templates/Cloud'
       macros:
@@ -71,8 +68,6 @@ zabbix_export:
           params: |
             var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
             var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
-            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
-
             function isoUtc(d) {
               return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
             }
@@ -84,7 +79,6 @@ zabbix_export:
               req.addHeader('content-type: application/json');
               req.setHttpAuth(HTTPAUTH_NONE);
               req.setProxy('');
-              req.setTimeout(timeout);
               var body = req.get(url);
               var status = req.getStatus();
               if (status < 200 || status >= 300) {
@@ -111,7 +105,7 @@ zabbix_export:
             var url = baseUrl + '/v1/organizations/usage_report/messages'
               + '?starting_at=' + encodeURIComponent(isoUtc(start))
               + '&ending_at=' + encodeURIComponent(isoUtc(now))
-              + '&bucket_width=1m&limit=1000';
+              + '&bucket_width=1m&limit=31';
 
             var data = getJson(url);
             var chosen = null;
@@ -167,12 +161,18 @@ zabbix_export:
               value: anthropic
             - tag: endpoint
               value: usage_report
+          triggers:
+            - uuid: d29c0538b7d2461090e20d5d822fbfff
+              expression: 'nodata(/Anthropic Admin API by script/anthropic.usage.raw,20m)=1'
+              name: 'Anthropic usage API data missing for 20m'
+              priority: AVERAGE
+              description: 'No fresh usage data has been collected for 20 minutes. Check Admin API key, permissions, proxy access, or Anthropic delays.'
 
         - uuid: 2d8229f2f8504c73bf81b18f833a5156
-          name: 'Anthropic: Cost raw (latest non-empty 1h bucket)'
+          name: 'Anthropic: Cost yesterday raw (UTC)'
           type: SCRIPT
           key: anthropic.cost.hour.raw
-          delay: 10m
+          delay: 30m
           history: 7d
           value_type: TEXT
           trends: '0'
@@ -180,8 +180,6 @@ zabbix_export:
           params: |
             var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
             var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
-            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
-
             function isoUtc(d) {
               return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
             }
@@ -193,7 +191,6 @@ zabbix_export:
               req.addHeader('content-type: application/json');
               req.setHttpAuth(HTTPAUTH_NONE);
               req.setProxy('');
-              req.setTimeout(timeout);
               var body = req.get(url);
               var status = req.getStatus();
               if (status < 200 || status >= 300) {
@@ -216,33 +213,23 @@ zabbix_export:
             }
 
             var now = new Date();
-            var start = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+            var yesterdayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0));
+            var yesterdayEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
             var url = baseUrl + '/v1/organizations/cost_report'
-              + '?starting_at=' + encodeURIComponent(isoUtc(start))
-              + '&ending_at=' + encodeURIComponent(isoUtc(now))
-              + '&bucket_width=1h&limit=1000';
+              + '?starting_at=' + encodeURIComponent(isoUtc(yesterdayStart))
+              + '&ending_at=' + encodeURIComponent(isoUtc(yesterdayEnd))
+              + '&bucket_width=1d&limit=1';
 
             var data = getJson(url);
-            var chosen = null;
+            var amount = 0;
             if (data.data && data.data.length) {
-              for (var i = data.data.length - 1; i >= 0; i--) {
-                var bucket = data.data[i];
-                var cost = sumAmount(bucket.results || []);
-                if (cost > 0) {
-                  chosen = bucket;
-                  break;
-                }
-              }
-            }
-
-            if (!chosen) {
-              return JSON.stringify({starting_at: null, ending_at: null, amount_usd: 0});
+              amount = sumAmount(data.data[0].results || []);
             }
 
             return JSON.stringify({
-              starting_at: chosen.starting_at,
-              ending_at: chosen.ending_at,
-              amount_usd: sumAmount(chosen.results || [])
+              starting_at: isoUtc(yesterdayStart),
+              ending_at: isoUtc(yesterdayEnd),
+              amount_usd: amount
             });
           tags:
             - tag: component
@@ -262,8 +249,6 @@ zabbix_export:
           params: |
             var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
             var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
-            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
-
             function isoUtc(d) {
               return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
             }
@@ -279,7 +264,6 @@ zabbix_export:
               req.addHeader('content-type: application/json');
               req.setHttpAuth(HTTPAUTH_NONE);
               req.setProxy('');
-              req.setTimeout(timeout);
               var body = req.get(url);
               var status = req.getStatus();
               if (status < 200 || status >= 300) {
@@ -303,23 +287,29 @@ zabbix_export:
 
             var now = new Date();
             var dayStart = startOfUtcDay(now);
+            var rangeStart = new Date(dayStart.getTime() - 24 * 60 * 60 * 1000);
+            var rangeEnd = new Date(dayStart.getTime() + 2 * 24 * 60 * 60 * 1000);
             var url = baseUrl + '/v1/organizations/cost_report'
-              + '?starting_at=' + encodeURIComponent(isoUtc(dayStart))
-              + '&ending_at=' + encodeURIComponent(isoUtc(now))
-              + '&bucket_width=1h&limit=1000';
+              + '?starting_at=' + encodeURIComponent(isoUtc(rangeStart))
+              + '&ending_at=' + encodeURIComponent(isoUtc(rangeEnd))
+              + '&bucket_width=1d&limit=3';
 
             var data = getJson(url);
-            var total = 0;
+            var amount = 0;
+            var dayStartStr = isoUtc(dayStart);
             if (data.data && data.data.length) {
               for (var i = 0; i < data.data.length; i++) {
-                total += sumAmount(data.data[i].results || []);
+                if (data.data[i].starting_at === dayStartStr) {
+                  amount = sumAmount(data.data[i].results || []);
+                  break;
+                }
               }
             }
 
             return JSON.stringify({
               starting_at: isoUtc(dayStart),
               ending_at: isoUtc(now),
-              amount_usd: total
+              amount_usd: amount
             });
           tags:
             - tag: component
@@ -328,6 +318,12 @@ zabbix_export:
               value: cost_report
             - tag: scope
               value: day
+          triggers:
+            - uuid: 2d4ab9cc43814ce7a0931dc530356668
+              expression: 'nodata(/Anthropic Admin API by script/anthropic.cost.day.raw,30m)=1'
+              name: 'Anthropic cost API data missing for 30m'
+              priority: AVERAGE
+              description: 'No fresh day spend data has been collected for 30 minutes.'
 
         - uuid: 91a045fa4a874cbe885c5fbe90ee0d89
           name: 'Anthropic: Cost month raw (UTC)'
@@ -341,8 +337,6 @@ zabbix_export:
           params: |
             var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
             var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
-            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
-
             function isoUtc(d) {
               return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
             }
@@ -358,7 +352,6 @@ zabbix_export:
               req.addHeader('content-type: application/json');
               req.setHttpAuth(HTTPAUTH_NONE);
               req.setProxy('');
-              req.setTimeout(timeout);
               var body = req.get(url);
               var status = req.getStatus();
               if (status < 200 || status >= 300) {
@@ -382,10 +375,12 @@ zabbix_export:
 
             var now = new Date();
             var monthStart = startOfUtcMonth(now);
+            var dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
+            var rangeEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
             var url = baseUrl + '/v1/organizations/cost_report'
               + '?starting_at=' + encodeURIComponent(isoUtc(monthStart))
-              + '&ending_at=' + encodeURIComponent(isoUtc(now))
-              + '&bucket_width=1d&limit=1000';
+              + '&ending_at=' + encodeURIComponent(isoUtc(rangeEnd))
+              + '&bucket_width=1d&limit=31';
 
             var data = getJson(url);
             var total = 0;
@@ -505,6 +500,12 @@ zabbix_export:
               value: anthropic
             - tag: metric
               value: tokens
+          triggers:
+            - uuid: 7bb8831d9b714a75bfffe5410168441e
+              expression: 'last(/Anthropic Admin API by script/anthropic.tokens.input.total)>{$ANTHROPIC.INPUT.TOKENS.MAX}'
+              name: 'Anthropic latest minute total input tokens are above {$ANTHROPIC.INPUT.TOKENS.MAX}'
+              priority: WARNING
+              description: 'Latest non-empty minute bucket has unusually high total input token volume.'
 
         - uuid: 5dc5470ea8f2414d8c5db85354eced40
           name: 'Anthropic: Usage output tokens'
@@ -525,6 +526,12 @@ zabbix_export:
               value: anthropic
             - tag: metric
               value: tokens
+          triggers:
+            - uuid: 276ccfe0df664d70b9c0d13f33042b8d
+              expression: 'last(/Anthropic Admin API by script/anthropic.tokens.output)>{$ANTHROPIC.OUTPUT.TOKENS.MAX}'
+              name: 'Anthropic latest minute output tokens are above {$ANTHROPIC.OUTPUT.TOKENS.MAX}'
+              priority: WARNING
+              description: 'Latest non-empty minute bucket has unusually high output token volume.'
 
         - uuid: 9a2b52a166c3446cb16d265ecf85b1bb
           name: 'Anthropic: Usage total tokens'
@@ -547,7 +554,7 @@ zabbix_export:
               value: tokens
 
         - uuid: 1f526ec9793b4f6e8656e8191f858da4
-          name: 'Anthropic: Cost latest hour spend'
+          name: 'Anthropic: Cost yesterday UTC'
           type: DEPENDENT
           key: anthropic.cost.hour.usd
           delay: '0'
@@ -587,6 +594,17 @@ zabbix_export:
               value: cost
             - tag: scope
               value: day
+          triggers:
+            - uuid: db73154c8f7b4696bdc69897a53ec471
+              expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.WARN}'
+              name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.WARN} USD'
+              priority: WARNING
+              description: 'Current UTC day cumulative spend exceeded the warning threshold.'
+            - uuid: c9d4bda3aaeb4e3e81e24f5cbcb1f8fc
+              expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.HIGH}'
+              name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.HIGH} USD'
+              priority: HIGH
+              description: 'Current UTC day cumulative spend exceeded the high threshold.'
 
         - uuid: 7b6f0a918d4e4939ad8f68f8886486d1
           name: 'Anthropic: Cost current UTC month'
@@ -609,52 +627,14 @@ zabbix_export:
               value: cost
             - tag: scope
               value: month
-
-      triggers:
-        - uuid: d29c0538b7d2461090e20d5d822fbfff
-          expression: 'nodata(/Anthropic Admin API by script/anthropic.usage.raw,20m)=1'
-          name: 'Anthropic usage API data missing for 20m'
-          priority: AVERAGE
-          description: 'No fresh usage data has been collected for 20 minutes. Check Admin API key, permissions, proxy access, or Anthropic delays.'
-
-        - uuid: 2d4ab9cc43814ce7a0931dc530356668
-          expression: 'nodata(/Anthropic Admin API by script/anthropic.cost.day.raw,30m)=1'
-          name: 'Anthropic cost API data missing for 30m'
-          priority: AVERAGE
-          description: 'No fresh day spend data has been collected for 30 minutes.'
-
-        - uuid: db73154c8f7b4696bdc69897a53ec471
-          expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.WARN}'
-          name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.WARN} USD'
-          priority: WARNING
-          description: 'Current UTC day cumulative spend exceeded the warning threshold.'
-
-        - uuid: c9d4bda3aaeb4e3e81e24f5cbcb1f8fc
-          expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.HIGH}'
-          name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.HIGH} USD'
-          priority: HIGH
-          description: 'Current UTC day cumulative spend exceeded the high threshold.'
-
-        - uuid: e0ec54a02f754084b729f04ef6a3f76b
-          expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.WARN}'
-          name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.WARN} USD'
-          priority: WARNING
-          description: 'Current UTC month cumulative spend exceeded the warning threshold.'
-
-        - uuid: 2c9fa59b2db949a08480e61d7f6ad6a6
-          expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.HIGH}'
-          name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.HIGH} USD'
-          priority: HIGH
-          description: 'Current UTC month cumulative spend exceeded the high threshold.'
-
-        - uuid: 276ccfe0df664d70b9c0d13f33042b8d
-          expression: 'last(/Anthropic Admin API by script/anthropic.tokens.output)>{$ANTHROPIC.OUTPUT.TOKENS.MAX}'
-          name: 'Anthropic latest minute output tokens are above {$ANTHROPIC.OUTPUT.TOKENS.MAX}'
-          priority: WARNING
-          description: 'Latest non-empty minute bucket has unusually high output token volume.'
-
-        - uuid: 7bb8831d9b714a75bfffe5410168441e
-          expression: 'last(/Anthropic Admin API by script/anthropic.tokens.input.total)>{$ANTHROPIC.INPUT.TOKENS.MAX}'
-          name: 'Anthropic latest minute total input tokens are above {$ANTHROPIC.INPUT.TOKENS.MAX}'
-          priority: WARNING
-          description: 'Latest non-empty minute bucket has unusually high total input token volume.'
+          triggers:
+            - uuid: e0ec54a02f754084b729f04ef6a3f76b
+              expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.WARN}'
+              name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.WARN} USD'
+              priority: WARNING
+              description: 'Current UTC month cumulative spend exceeded the warning threshold.'
+            - uuid: 2c9fa59b2db949a08480e61d7f6ad6a6
+              expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.HIGH}'
+              name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.HIGH} USD'
+              priority: HIGH
+              description: 'Current UTC month cumulative spend exceeded the high threshold.'
