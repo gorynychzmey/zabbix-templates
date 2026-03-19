@@ -1,0 +1,660 @@
+zabbix_export:
+  version: '7.4'
+  template_groups:
+    - uuid: 6f7df1c2b0f64410a1a5c221c71a2a01
+      name: 'Templates/Cloud'
+  templates:
+    - uuid: 2a4e2d2c75be4b3ea3ce3d3200ae01b1
+      template: 'Anthropic Admin API by script'
+      name: 'Anthropic Admin API by script'
+      description: |
+        Monitors Anthropic Usage & Cost Admin API for an organization.
+
+        What it collects:
+        - latest non-empty minute bucket for message usage tokens
+        - latest non-empty hour bucket for spend
+        - cumulative spend for current UTC day
+        - cumulative spend for current UTC month
+
+        Requirements:
+        - Zabbix 7.x
+        - Admin API key (sk-ant-admin...)
+        - Host linked to this template may be a dummy/API host; no agent required
+
+        Notes:
+        - Anthropic documents that usage/cost data is typically available with a delay of up to ~5 minutes.
+        - All time calculations are done in UTC because Anthropic bucket boundaries are UTC.
+        - The API key is stored in a user macro for simplicity. After import, convert it to Secret text in the UI if desired.
+      vendor:
+        name: OpenAI
+        version: '1.0'
+      groups:
+        - name: 'Templates/Cloud'
+      macros:
+        - macro: '{$ANTHROPIC.ADMIN.API.KEY}'
+          value: CHANGE_ME
+          description: 'Anthropic Admin API key (sk-ant-admin...)'
+        - macro: '{$ANTHROPIC.API.BASEURL}'
+          value: 'https://api.anthropic.com'
+          description: 'Anthropic API base URL'
+        - macro: '{$ANTHROPIC.HTTP.TIMEOUT}'
+          value: '30'
+          description: 'HTTP timeout in seconds for Admin API requests'
+        - macro: '{$ANTHROPIC.SPEND.DAY.WARN}'
+          value: '10'
+          description: 'Warning threshold for current UTC day spend, USD'
+        - macro: '{$ANTHROPIC.SPEND.DAY.HIGH}'
+          value: '25'
+          description: 'High threshold for current UTC day spend, USD'
+        - macro: '{$ANTHROPIC.SPEND.MONTH.WARN}'
+          value: '100'
+          description: 'Warning threshold for current UTC month spend, USD'
+        - macro: '{$ANTHROPIC.SPEND.MONTH.HIGH}'
+          value: '250'
+          description: 'High threshold for current UTC month spend, USD'
+        - macro: '{$ANTHROPIC.OUTPUT.TOKENS.MAX}'
+          value: '500000'
+          description: 'Warning threshold for latest minute output tokens'
+        - macro: '{$ANTHROPIC.INPUT.TOKENS.MAX}'
+          value: '1000000'
+          description: 'Warning threshold for latest minute total input tokens'
+      items:
+        - uuid: 2fdaf48ea7cb4f50b3c95b865df79612
+          name: 'Anthropic: Usage raw (latest non-empty 1m bucket)'
+          type: SCRIPT
+          key: anthropic.usage.raw
+          delay: 5m
+          history: 7d
+          value_type: TEXT
+          trends: '0'
+          timeout: '{$ANTHROPIC.HTTP.TIMEOUT}'
+          params: |
+            var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
+            var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
+            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
+
+            function isoUtc(d) {
+              return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+            }
+
+            function getJson(url) {
+              var req = new HttpRequest();
+              req.addHeader('anthropic-version: 2023-06-01');
+              req.addHeader('x-api-key: ' + apiKey);
+              req.addHeader('content-type: application/json');
+              req.setHttpAuth(HTTPAUTH_NONE);
+              req.setProxy('');
+              req.setTimeout(timeout);
+              var body = req.get(url);
+              var status = req.getStatus();
+              if (status < 200 || status >= 300) {
+                throw 'Anthropic API returned HTTP ' + status + ': ' + body;
+              }
+              return JSON.parse(body);
+            }
+
+            function sumField(results, field) {
+              var total = 0;
+              if (!results) return total;
+              for (var i = 0; i < results.length; i++) {
+                total += Number(results[i][field] || 0);
+              }
+              return total;
+            }
+
+            if (!apiKey || apiKey === 'CHANGE_ME') {
+              throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
+            }
+
+            var now = new Date();
+            var start = new Date(now.getTime() - 15 * 60 * 1000);
+            var url = baseUrl + '/v1/organizations/usage_report/messages'
+              + '?starting_at=' + encodeURIComponent(isoUtc(start))
+              + '&ending_at=' + encodeURIComponent(isoUtc(now))
+              + '&bucket_width=1m&limit=1000';
+
+            var data = getJson(url);
+            var chosen = null;
+            if (data.data && data.data.length) {
+              for (var i = data.data.length - 1; i >= 0; i--) {
+                var bucket = data.data[i];
+                var results = bucket.results || [];
+                var total = 0;
+                for (var j = 0; j < results.length; j++) {
+                  total += Number(results[j].uncached_input_tokens || 0)
+                    + Number(results[j].cache_creation_input_tokens || 0)
+                    + Number(results[j].cache_read_input_tokens || 0)
+                    + Number(results[j].output_tokens || 0);
+                }
+                if (total > 0) {
+                  chosen = bucket;
+                  break;
+                }
+              }
+            }
+
+            if (!chosen) {
+              return JSON.stringify({
+                starting_at: null,
+                ending_at: null,
+                uncached_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 0,
+                total_input_tokens: 0,
+                total_tokens: 0
+              });
+            }
+
+            var results = chosen.results || [];
+            var uncached = sumField(results, 'uncached_input_tokens');
+            var cacheCreation = sumField(results, 'cache_creation_input_tokens');
+            var cacheRead = sumField(results, 'cache_read_input_tokens');
+            var output = sumField(results, 'output_tokens');
+
+            return JSON.stringify({
+              starting_at: chosen.starting_at,
+              ending_at: chosen.ending_at,
+              uncached_input_tokens: uncached,
+              cache_creation_input_tokens: cacheCreation,
+              cache_read_input_tokens: cacheRead,
+              output_tokens: output,
+              total_input_tokens: uncached + cacheCreation + cacheRead,
+              total_tokens: uncached + cacheCreation + cacheRead + output
+            });
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: endpoint
+              value: usage_report
+
+        - uuid: 2d8229f2f8504c73bf81b18f833a5156
+          name: 'Anthropic: Cost raw (latest non-empty 1h bucket)'
+          type: SCRIPT
+          key: anthropic.cost.hour.raw
+          delay: 10m
+          history: 7d
+          value_type: TEXT
+          trends: '0'
+          timeout: '{$ANTHROPIC.HTTP.TIMEOUT}'
+          params: |
+            var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
+            var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
+            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
+
+            function isoUtc(d) {
+              return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+            }
+
+            function getJson(url) {
+              var req = new HttpRequest();
+              req.addHeader('anthropic-version: 2023-06-01');
+              req.addHeader('x-api-key: ' + apiKey);
+              req.addHeader('content-type: application/json');
+              req.setHttpAuth(HTTPAUTH_NONE);
+              req.setProxy('');
+              req.setTimeout(timeout);
+              var body = req.get(url);
+              var status = req.getStatus();
+              if (status < 200 || status >= 300) {
+                throw 'Anthropic API returned HTTP ' + status + ': ' + body;
+              }
+              return JSON.parse(body);
+            }
+
+            function sumAmount(results) {
+              var total = 0;
+              if (!results) return total;
+              for (var i = 0; i < results.length; i++) {
+                total += Number(results[i].amount || 0) / 100.0;
+              }
+              return total;
+            }
+
+            if (!apiKey || apiKey === 'CHANGE_ME') {
+              throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
+            }
+
+            var now = new Date();
+            var start = new Date(now.getTime() - 48 * 60 * 60 * 1000);
+            var url = baseUrl + '/v1/organizations/cost_report'
+              + '?starting_at=' + encodeURIComponent(isoUtc(start))
+              + '&ending_at=' + encodeURIComponent(isoUtc(now))
+              + '&bucket_width=1h&limit=1000';
+
+            var data = getJson(url);
+            var chosen = null;
+            if (data.data && data.data.length) {
+              for (var i = data.data.length - 1; i >= 0; i--) {
+                var bucket = data.data[i];
+                var cost = sumAmount(bucket.results || []);
+                if (cost > 0) {
+                  chosen = bucket;
+                  break;
+                }
+              }
+            }
+
+            if (!chosen) {
+              return JSON.stringify({starting_at: null, ending_at: null, amount_usd: 0});
+            }
+
+            return JSON.stringify({
+              starting_at: chosen.starting_at,
+              ending_at: chosen.ending_at,
+              amount_usd: sumAmount(chosen.results || [])
+            });
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: endpoint
+              value: cost_report
+
+        - uuid: 39bb0ef53e0d420689e001fd4f1d1bb6
+          name: 'Anthropic: Cost today raw (UTC)'
+          type: SCRIPT
+          key: anthropic.cost.day.raw
+          delay: 10m
+          history: 7d
+          value_type: TEXT
+          trends: '0'
+          timeout: '{$ANTHROPIC.HTTP.TIMEOUT}'
+          params: |
+            var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
+            var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
+            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
+
+            function isoUtc(d) {
+              return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+            }
+
+            function startOfUtcDay(d) {
+              return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
+            }
+
+            function getJson(url) {
+              var req = new HttpRequest();
+              req.addHeader('anthropic-version: 2023-06-01');
+              req.addHeader('x-api-key: ' + apiKey);
+              req.addHeader('content-type: application/json');
+              req.setHttpAuth(HTTPAUTH_NONE);
+              req.setProxy('');
+              req.setTimeout(timeout);
+              var body = req.get(url);
+              var status = req.getStatus();
+              if (status < 200 || status >= 300) {
+                throw 'Anthropic API returned HTTP ' + status + ': ' + body;
+              }
+              return JSON.parse(body);
+            }
+
+            function sumAmount(results) {
+              var total = 0;
+              if (!results) return total;
+              for (var i = 0; i < results.length; i++) {
+                total += Number(results[i].amount || 0) / 100.0;
+              }
+              return total;
+            }
+
+            if (!apiKey || apiKey === 'CHANGE_ME') {
+              throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
+            }
+
+            var now = new Date();
+            var dayStart = startOfUtcDay(now);
+            var url = baseUrl + '/v1/organizations/cost_report'
+              + '?starting_at=' + encodeURIComponent(isoUtc(dayStart))
+              + '&ending_at=' + encodeURIComponent(isoUtc(now))
+              + '&bucket_width=1h&limit=1000';
+
+            var data = getJson(url);
+            var total = 0;
+            if (data.data && data.data.length) {
+              for (var i = 0; i < data.data.length; i++) {
+                total += sumAmount(data.data[i].results || []);
+              }
+            }
+
+            return JSON.stringify({
+              starting_at: isoUtc(dayStart),
+              ending_at: isoUtc(now),
+              amount_usd: total
+            });
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: endpoint
+              value: cost_report
+            - tag: scope
+              value: day
+
+        - uuid: 91a045fa4a874cbe885c5fbe90ee0d89
+          name: 'Anthropic: Cost month raw (UTC)'
+          type: SCRIPT
+          key: anthropic.cost.month.raw
+          delay: 30m
+          history: 30d
+          value_type: TEXT
+          trends: '0'
+          timeout: '{$ANTHROPIC.HTTP.TIMEOUT}'
+          params: |
+            var baseUrl = '{$ANTHROPIC.API.BASEURL}'.replace(/\/$/, '');
+            var apiKey = '{$ANTHROPIC.ADMIN.API.KEY}';
+            var timeout = Number('{$ANTHROPIC.HTTP.TIMEOUT}') || 30;
+
+            function isoUtc(d) {
+              return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+            }
+
+            function startOfUtcMonth(d) {
+              return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1, 0, 0, 0));
+            }
+
+            function getJson(url) {
+              var req = new HttpRequest();
+              req.addHeader('anthropic-version: 2023-06-01');
+              req.addHeader('x-api-key: ' + apiKey);
+              req.addHeader('content-type: application/json');
+              req.setHttpAuth(HTTPAUTH_NONE);
+              req.setProxy('');
+              req.setTimeout(timeout);
+              var body = req.get(url);
+              var status = req.getStatus();
+              if (status < 200 || status >= 300) {
+                throw 'Anthropic API returned HTTP ' + status + ': ' + body;
+              }
+              return JSON.parse(body);
+            }
+
+            function sumAmount(results) {
+              var total = 0;
+              if (!results) return total;
+              for (var i = 0; i < results.length; i++) {
+                total += Number(results[i].amount || 0) / 100.0;
+              }
+              return total;
+            }
+
+            if (!apiKey || apiKey === 'CHANGE_ME') {
+              throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
+            }
+
+            var now = new Date();
+            var monthStart = startOfUtcMonth(now);
+            var url = baseUrl + '/v1/organizations/cost_report'
+              + '?starting_at=' + encodeURIComponent(isoUtc(monthStart))
+              + '&ending_at=' + encodeURIComponent(isoUtc(now))
+              + '&bucket_width=1d&limit=1000';
+
+            var data = getJson(url);
+            var total = 0;
+            if (data.data && data.data.length) {
+              for (var i = 0; i < data.data.length; i++) {
+                total += sumAmount(data.data[i].results || []);
+              }
+            }
+
+            return JSON.stringify({
+              starting_at: isoUtc(monthStart),
+              ending_at: isoUtc(now),
+              amount_usd: total
+            });
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: endpoint
+              value: cost_report
+            - tag: scope
+              value: month
+
+        - uuid: 9f678634cb9940b8aa91574673abcb8f
+          name: 'Anthropic: Usage bucket start'
+          type: DEPENDENT
+          key: anthropic.usage.bucket.start
+          delay: '0'
+          history: 30d
+          value_type: CHAR
+          trends: '0'
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.starting_at
+          tags:
+            - tag: component
+              value: anthropic
+
+        - uuid: 64b0904e637f45e4bf5246647af90d0c
+          name: 'Anthropic: Usage uncached input tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.input.uncached
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.uncached_input_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: 7e8c4065f6f94af8bc5e663ab30bcdf3
+          name: 'Anthropic: Usage cache creation input tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.input.cache_create
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.cache_creation_input_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: c80cb22bb391488889c9d4454902f73b
+          name: 'Anthropic: Usage cache read input tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.input.cache_read
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.cache_read_input_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: 6fb8773389c84bcb82f85c4f83f6d19b
+          name: 'Anthropic: Usage total input tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.input.total
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.total_input_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: 5dc5470ea8f2414d8c5db85354eced40
+          name: 'Anthropic: Usage output tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.output
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.output_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: 9a2b52a166c3446cb16d265ecf85b1bb
+          name: 'Anthropic: Usage total tokens'
+          type: DEPENDENT
+          key: anthropic.tokens.total
+          delay: '0'
+          history: 30d
+          value_type: UNSIGNED
+          master_item:
+            key: anthropic.usage.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.total_tokens
+          units: tokens
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: tokens
+
+        - uuid: 1f526ec9793b4f6e8656e8191f858da4
+          name: 'Anthropic: Cost latest hour spend'
+          type: DEPENDENT
+          key: anthropic.cost.hour.usd
+          delay: '0'
+          history: 30d
+          value_type: FLOAT
+          master_item:
+            key: anthropic.cost.hour.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.amount_usd
+          units: USD
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: cost
+
+        - uuid: 3cfe73eeb93a45b4becdb69eb08ff731
+          name: 'Anthropic: Cost current UTC day'
+          type: DEPENDENT
+          key: anthropic.cost.day.usd
+          delay: '0'
+          history: 90d
+          value_type: FLOAT
+          master_item:
+            key: anthropic.cost.day.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.amount_usd
+          units: USD
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: cost
+            - tag: scope
+              value: day
+
+        - uuid: 7b6f0a918d4e4939ad8f68f8886486d1
+          name: 'Anthropic: Cost current UTC month'
+          type: DEPENDENT
+          key: anthropic.cost.month.usd
+          delay: '0'
+          history: 365d
+          value_type: FLOAT
+          master_item:
+            key: anthropic.cost.month.raw
+          preprocessing:
+            - type: JSONPATH
+              parameters:
+                - $.amount_usd
+          units: USD
+          tags:
+            - tag: component
+              value: anthropic
+            - tag: metric
+              value: cost
+            - tag: scope
+              value: month
+
+      triggers:
+        - uuid: d29c0538b7d2461090e20d5d822fbfff
+          expression: 'nodata(/Anthropic Admin API by script/anthropic.usage.raw,20m)=1'
+          name: 'Anthropic usage API data missing for 20m'
+          priority: AVERAGE
+          description: 'No fresh usage data has been collected for 20 minutes. Check Admin API key, permissions, proxy access, or Anthropic delays.'
+
+        - uuid: 2d4ab9cc43814ce7a0931dc530356668
+          expression: 'nodata(/Anthropic Admin API by script/anthropic.cost.day.raw,30m)=1'
+          name: 'Anthropic cost API data missing for 30m'
+          priority: AVERAGE
+          description: 'No fresh day spend data has been collected for 30 minutes.'
+
+        - uuid: db73154c8f7b4696bdc69897a53ec471
+          expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.WARN}'
+          name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.WARN} USD'
+          priority: WARNING
+          description: 'Current UTC day cumulative spend exceeded the warning threshold.'
+
+        - uuid: c9d4bda3aaeb4e3e81e24f5cbcb1f8fc
+          expression: 'last(/Anthropic Admin API by script/anthropic.cost.day.usd)>{$ANTHROPIC.SPEND.DAY.HIGH}'
+          name: 'Anthropic current UTC day spend is above {$ANTHROPIC.SPEND.DAY.HIGH} USD'
+          priority: HIGH
+          description: 'Current UTC day cumulative spend exceeded the high threshold.'
+
+        - uuid: e0ec54a02f754084b729f04ef6a3f76b
+          expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.WARN}'
+          name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.WARN} USD'
+          priority: WARNING
+          description: 'Current UTC month cumulative spend exceeded the warning threshold.'
+
+        - uuid: 2c9fa59b2db949a08480e61d7f6ad6a6
+          expression: 'last(/Anthropic Admin API by script/anthropic.cost.month.usd)>{$ANTHROPIC.SPEND.MONTH.HIGH}'
+          name: 'Anthropic current UTC month spend is above {$ANTHROPIC.SPEND.MONTH.HIGH} USD'
+          priority: HIGH
+          description: 'Current UTC month cumulative spend exceeded the high threshold.'
+
+        - uuid: 276ccfe0df664d70b9c0d13f33042b8d
+          expression: 'last(/Anthropic Admin API by script/anthropic.tokens.output)>{$ANTHROPIC.OUTPUT.TOKENS.MAX}'
+          name: 'Anthropic latest minute output tokens are above {$ANTHROPIC.OUTPUT.TOKENS.MAX}'
+          priority: WARNING
+          description: 'Latest non-empty minute bucket has unusually high output token volume.'
+
+        - uuid: 7bb8831d9b714a75bfffe5410168441e
+          expression: 'last(/Anthropic Admin API by script/anthropic.tokens.input.total)>{$ANTHROPIC.INPUT.TOKENS.MAX}'
+          name: 'Anthropic latest minute total input tokens are above {$ANTHROPIC.INPUT.TOKENS.MAX}'
+          priority: WARNING
+          description: 'Latest non-empty minute bucket has unusually high total input token volume.'
