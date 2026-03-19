@@ -1,0 +1,24 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Archives / local exports
+*.zip
+*.tar
+*.gz
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+
+# Python helpers, if any are added later
+__pycache__/
+*.pyc
+
+# Local secrets or experiments
+.env
+.env.*
+*.local
