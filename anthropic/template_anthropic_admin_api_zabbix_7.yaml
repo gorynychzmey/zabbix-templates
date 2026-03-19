@@ -285,10 +285,11 @@ zabbix_export:
               throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
             }
 
+            var DAY_MS = 24 * 60 * 60 * 1000;
             var now = new Date();
             var dayStart = startOfUtcDay(now);
-            var rangeStart = new Date(dayStart.getTime() - 24 * 60 * 60 * 1000);
-            var rangeEnd = new Date(dayStart.getTime() + 2 * 24 * 60 * 60 * 1000);
+            var rangeStart = new Date(dayStart.getTime() - DAY_MS);     // yesterday
+            var rangeEnd = new Date(dayStart.getTime() + 2 * DAY_MS);   // day after tomorrow
             var url = baseUrl + '/v1/organizations/cost_report'
               + '?starting_at=' + encodeURIComponent(isoUtc(rangeStart))
               + '&ending_at=' + encodeURIComponent(isoUtc(rangeEnd))
@@ -373,13 +374,17 @@ zabbix_export:
               throw 'Set {$ANTHROPIC.ADMIN.API.KEY} macro';
             }
 
+            function startOfUtcDay(d) {
+              return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 0, 0, 0));
+            }
+
+            var DAY_MS = 24 * 60 * 60 * 1000;
             var now = new Date();
             var monthStart = startOfUtcMonth(now);
-            var dayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0));
-            var rangeEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+            var tomorrowStart = new Date(startOfUtcDay(now).getTime() + DAY_MS); // API requires full-day aligned range
             var url = baseUrl + '/v1/organizations/cost_report'
               + '?starting_at=' + encodeURIComponent(isoUtc(monthStart))
-              + '&ending_at=' + encodeURIComponent(isoUtc(rangeEnd))
+              + '&ending_at=' + encodeURIComponent(isoUtc(tomorrowStart))
               + '&bucket_width=1d&limit=31';
 
             var data = getJson(url);
